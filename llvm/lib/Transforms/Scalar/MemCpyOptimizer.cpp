@@ -52,6 +52,7 @@
 #include "llvm/IR/User.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -71,6 +72,11 @@ STATISTIC(NumMoveToCpy, "Number of memmoves converted to memcpy");
 STATISTIC(NumCpyToSet, "Number of memcpys converted to memset");
 STATISTIC(NumCallSlot, "Number of call slot optimizations performed");
 STATISTIC(NumStackMove, "Number of stack-move optimizations performed");
+STATISTIC(NumReadOnlyCopy, "Number of copies forwarded to read-only users");
+
+static cl::opt<unsigned> MaxReadOnlyCopyInstructions(
+    "memcpyopt-max-readonly-copy-instructions", cl::init(300), cl::Hidden,
+    cl::desc("Maximum instructions to visit when forwarding a read-only copy"));
 
 namespace {
 
@@ -1792,6 +1798,180 @@ static bool isZeroSize(Value *Size) {
   return false;
 }
 
+// Forward loads of a stack snapshot to the copied memory, provided that memory
+// has not changed since the copy. Unlike stack-move optimization, this does not
+// require the source to be an alloca or extend its lifetime. In particular, the
+// source may be freed after the last read.
+bool MemCpyOptPass::performReadOnlyCopyOptzn(MemCpyInst *M,
+                                             BatchAAResults &BAA) {
+  Value *Dest = M->getDest();
+  auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(Dest));
+  auto *Len = dyn_cast<ConstantInt>(M->getLength());
+  if (!AI || !AI->isStaticAlloca() || !Len)
+    return false;
+
+  const DataLayout &DL = M->getDataLayout();
+  std::optional<TypeSize> AllocaSize = AI->getAllocationSize(DL);
+  if (!AllocaSize || AllocaSize->isScalable())
+    return false;
+
+  // Either the copy covers the entire alloca, or it covers an offset payload
+  // through the end of an otherwise unused alloca. The latter is emitted by
+  // Rust's consuming vector iterator. Keeping the payload as a separate root
+  // allows the source to be defined after the payload GEP.
+  bool FullAlloca = Dest == AI && *AllocaSize == Len->getValue() &&
+                    M->getParent()->isEntryBlock();
+  auto *Payload = dyn_cast<GetElementPtrInst>(Dest);
+  if (!FullAlloca) {
+    if (!Payload || Payload->getPointerOperand() != AI ||
+        !Payload->isInBounds())
+      return false;
+    std::optional<int64_t> Offset = Payload->getPointerOffsetFrom(AI, DL);
+    if (!Offset || *Offset < 0 ||
+        uint64_t(*Offset) > AllocaSize->getFixedValue() ||
+        Len->getZExtValue() != AllocaSize->getFixedValue() - *Offset)
+      return false;
+    for (Use &U : AI->uses()) {
+      auto *I = dyn_cast<Instruction>(U.getUser());
+      if (I != Payload && (!I || !I->isLifetimeStartOrEnd()))
+        return false;
+    }
+  }
+
+  Value *Src = M->getSource();
+  // Stack sources have lifetime and reuse rules handled by stack-move above.
+  if (Src->getType() != Dest->getType() ||
+      isa<AllocaInst>(getUnderlyingObject(Src)))
+    return false;
+  Align SrcAlign = std::max(M->getSourceAlign().valueOrOne(),
+                           getKnownAlignment(Src, DL, M, AC, DT));
+  Align DestAlign = FullAlloca ? AI->getAlign()
+                               : M->getDestAlign().valueOrOne();
+  if (SrcAlign < DestAlign)
+    return false;
+
+  SmallVector<Value *, 16> Worklist{Dest};
+  SmallPtrSet<Instruction *, 32> Users;
+  SmallVector<LoadInst *, 8> Loads;
+  SmallVector<Instruction *, 4> LifetimeMarkers;
+  if (!FullAlloca)
+    for (Use &U : AI->uses())
+      if (auto *I = dyn_cast<Instruction>(U.getUser()))
+        if (I->isLifetimeStartOrEnd())
+          LifetimeMarkers.push_back(I);
+  unsigned MaxUses = getDefaultMaxUsesToExploreForCaptureTracking();
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    for (Use &U : V->uses()) {
+      if (!MaxUses--)
+        return false;
+      auto *I = dyn_cast<Instruction>(U.getUser());
+      if (!I)
+        return false;
+      if (I == M) {
+        if (U.getOperandNo() != 0)
+          return false;
+        continue;
+      }
+      if (!Users.insert(I).second)
+        continue;
+      if (I->isLifetimeStartOrEnd()) {
+        LifetimeMarkers.push_back(I);
+        continue;
+      }
+      // Replacing the alloca must not introduce a use before Src is defined,
+      // including pointer arithmetic that precedes the initializing copy.
+      if (!DT->dominates(Src, I))
+        return false;
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+        if (!GEP->isInBounds())
+          return false;
+        // A payload starts partway through the alloca. Each derived pointer
+        // must advance from its parent; an inbounds load then remains inside
+        // the copied suffix. Dynamic offsets need the no-unsigned-wrap flag.
+        if (!FullAlloca) {
+          std::optional<int64_t> Offset = GEP->getPointerOffsetFrom(V, DL);
+          if ((!Offset || *Offset < 0) && !GEP->hasNoUnsignedWrap())
+            return false;
+        }
+        Worklist.push_back(I);
+        continue;
+      }
+      auto *LI = dyn_cast<LoadInst>(I);
+      if (!LI || !LI->isSimple() || !DT->dominates(M, LI) ||
+          LI->getAlign() > DestAlign)
+        return false;
+      Loads.push_back(LI);
+    }
+  }
+  if (Loads.empty())
+    return false;
+
+  // Walk backwards from every read to the copy, including loop backedges.
+  // Do not follow the loads' optimized MemoryUse links: those can skip writes
+  // which do not alias the destination but do alias the source. Share visited
+  // instructions between reads and bound the entire traversal.
+  SmallVector<Instruction *, 16> ToScan(Loads.begin(), Loads.end());
+  SmallPtrSet<Instruction *, 32> Visited;
+  MemoryLocation SrcLoc(Src, LocationSize::precise(Len->getZExtValue()));
+  unsigned Remaining = MaxReadOnlyCopyInstructions;
+  while (!ToScan.empty()) {
+    Instruction *I = ToScan.pop_back_val();
+    while (I != M && Visited.insert(I).second) {
+      if (!Remaining--)
+        return false;
+      // If a loop re-evaluates the source pointer without executing the copy,
+      // this read would use a different source instance from the snapshot.
+      if (I == Src)
+        return false;
+      // Synchronization can expose changes by other threads even when the
+      // synchronizing instruction does not directly access the copied bytes.
+      if (I->isAtomic() || I->isVolatile())
+        return false;
+      // A read-only call may still end the source allocation's lifetime.
+      if (auto *CB = dyn_cast<CallBase>(I))
+        if (CB->maySynchronize() || !CB->hasFnAttr(Attribute::NoFree))
+          return false;
+      if (isModSet(BAA.getModRefInfo(I, SrcLoc)))
+        return false;
+      if (Instruction *Prev = I->getPrevNode()) {
+        I = Prev;
+        continue;
+      }
+      for (BasicBlock *Pred : predecessors(I->getParent())) {
+        if (ToScan.size() >= Remaining)
+          return false;
+        ToScan.push_back(Pred->getTerminator());
+      }
+      break;
+    }
+  }
+
+  for (Instruction *I : Users)
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(I))
+      GEP->dropPoisonGeneratingFlags();
+  // Stack lifetime markers must not be redirected to the source allocation.
+  for (Instruction *I : LifetimeMarkers)
+    eraseInstruction(I);
+  Dest->replaceAllUsesWith(Src);
+  if (Payload)
+    eraseInstruction(Payload);
+  eraseInstruction(AI);
+
+  for (LoadInst *LI : Loads) {
+    // Invariance and alias metadata about the stack snapshot need not hold
+    // for the source. Rebuild the MemoryUse for the changed memory location.
+    LI->dropUnknownNonDebugMetadata();
+    MemoryUseOrDef *OldAccess = MSSA->getMemoryAccess(LI);
+    auto *NewAccess =
+        MSSAU->createMemoryAccessBefore(LI, nullptr, OldAccess);
+    MSSAU->removeMemoryAccess(OldAccess);
+    MSSAU->insertUse(cast<MemoryUse>(NewAccess), /*RenameUses=*/true);
+  }
+  ++NumReadOnlyCopy;
+  return true;
+}
+
 /// Perform simplification of memcpy's.  If we have memcpy A
 /// which copies X to Y, and memcpy B which copies Y to Z, then we can rewrite
 /// B to be a memcpy from X to Z (or potentially a memmove, depending on
@@ -1912,7 +2092,8 @@ bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {
   if (Len == nullptr)
     return false;
   if (performStackMoveOptzn(M, M, M->getDest(), M->getSource(),
-                            TypeSize::getFixed(Len->getZExtValue()), BAA)) {
+                            TypeSize::getFixed(Len->getZExtValue()), BAA) ||
+      performReadOnlyCopyOptzn(M, BAA)) {
     // Avoid invalidating the iterator.
     BBI = M->getNextNode()->getIterator();
     eraseInstruction(M);
